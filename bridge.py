@@ -8,7 +8,7 @@ Usage in Slack:  @BotName repo:<name> <task>
   repo:<name> resolves to $DEVIN_HOME/<name> (default ~/code).
   Without repo:, the task runs in $DEVIN_HOME itself.
   A @mention reply inside a task thread resumes that thread's devin session
-  (`devin -r`). Top-level DM messages keep continuing the latest DM session.
+  (`devin -r`). Each top-level DM message starts its own task thread.
 
 Only Slack user IDs listed in ALLOWED_USERS can trigger runs, and only their
 thread messages are included as context.
@@ -324,8 +324,7 @@ async def on_mention(event, client):
         return
 
     repo, task = parse_mention(event.get("text", ""))
-    is_dm = event.get("channel_type") == "im"
-    key = event.get("thread_ts") or ("dm" if is_dm else ts)
+    key = thread_ts
     mapped = thread_sessions.get(channel, key)
 
     session_id = None
