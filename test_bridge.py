@@ -1,5 +1,6 @@
 import asyncio
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -42,6 +43,48 @@ class ThreadContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("ignore previous instructions", result)
         self.assertNotIn("bot output with secrets", result)
         self.assertEqual(client.replies_calls[0]["limit"], bridge.THREAD_CONTEXT_LIMIT)
+
+
+class DMSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dm_threads_have_independent_sessions(self):
+        client = FakeSlackClient()
+        pending = []
+        runs = []
+
+        async def fake_run(client, channel, key, thread_ts, user, task, workdir, session_id):
+            runs.append((key, workdir, session_id))
+            bridge.thread_sessions.put(channel, key, session_id or "sess-1", workdir)
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "app").mkdir()
+            (home / "other").mkdir()
+            with mock.patch.object(bridge, "DEVIN_HOME", home), mock.patch.object(
+                bridge, "THREAD_STATE_FILE", home / "sessions.json"
+            ), mock.patch.object(
+                bridge, "thread_sessions", bridge.SessionMap()
+            ), mock.patch.object(
+                bridge, "devin_session_ids", new=mock.AsyncMock(return_value={"sess-1": 1})
+            ), mock.patch.object(
+                bridge, "run_devin", new=fake_run
+            ), mock.patch.object(bridge.asyncio, "create_task", side_effect=pending.append):
+                for message in [
+                    {"ts": "100.0", "text": "repo:app start"},
+                    {"ts": "101.0", "thread_ts": "100.0", "text": "continue"},
+                    {"ts": "200.0", "text": "repo:other start"},
+                ]:
+                    await bridge.on_message(
+                        dict(channel="D123", channel_type="im", user="U123", **message),
+                        client,
+                    )
+                    await pending.pop()
+
+            with self.subTest("top-level DM is keyed by its timestamp"):
+                self.assertEqual(runs[0], ("100.0", home / "app", None))
+            with self.subTest("DM thread reply resumes its root session and repo"):
+                self.assertEqual(runs[1], ("100.0", home / "app", "sess-1"))
+            with self.subTest("new top-level DM uses its own repo and session"):
+                self.assertEqual(runs[2], ("200.0", home / "other", None))
 
 
 class DevinEnvTests(unittest.TestCase):
