@@ -12,14 +12,25 @@ import bridge
 
 
 class FakeSlackClient:
-    def __init__(self, messages=None):
+    def __init__(self, messages=None, max_page_size=None):
         self.messages = messages or []
+        self.max_page_size = max_page_size
         self.posts = []
         self.replies_calls = []
 
     async def conversations_replies(self, **kwargs):
         self.replies_calls.append(kwargs)
-        return {"messages": self.messages}
+        start = int(kwargs.get("cursor") or 0)
+        limit = kwargs["limit"]
+        if self.max_page_size is not None:
+            limit = min(limit, self.max_page_size)
+        end = start + limit
+        return {
+            "messages": self.messages[start:end],
+            "response_metadata": {
+                "next_cursor": str(end) if end < len(self.messages) else "",
+            },
+        }
 
     async def chat_postMessage(self, **kwargs):
         self.posts.append(kwargs)
@@ -42,6 +53,20 @@ class ThreadContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("ignore previous instructions", result)
         self.assertNotIn("bot output with secrets", result)
         self.assertEqual(client.replies_calls[0]["limit"], bridge.THREAD_CONTEXT_LIMIT)
+        self.assertEqual(len(client.replies_calls), 1)
+
+    async def test_includes_latest_messages_across_pages(self):
+        messages = [{"user": "U123", "text": f"reply {i}"} for i in range(1, 47)]
+        messages.append({"user": "U123", "text": "<@B123> latest mention"})
+        client = FakeSlackClient(messages, max_page_size=15)
+
+        result = await bridge.thread_context(client, "C123", "123.456", {"U123"})
+
+        self.assertIn("<U123>: latest mention", result)
+        self.assertEqual(
+            result.splitlines(),
+            [f"<U123>: reply {i}" for i in range(18, 47)] + ["<U123>: latest mention"],
+        )
 
 
 class DevinEnvTests(unittest.TestCase):
