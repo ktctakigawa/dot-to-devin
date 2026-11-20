@@ -30,7 +30,7 @@ class FakeProcess:
             self.stdout.feed_data(json.dumps({"jsonrpc": "2.0", **frame}).encode() + b"\n")
         self.stdout.feed_eof()
         self.pid = 123
-        self.wait = mock.AsyncMock()
+        self.wait = mock.AsyncMock(return_value=0)
 
 
 def result(request_id, **payload):
@@ -70,6 +70,15 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proc.stdin.frames[2]["params"]["sessionId"], "sess-example")
         self.assertEqual(proc.stdin.frames[3]["result"]["outcome"]["outcome"], "cancelled")
         proc.wait.assert_awaited_once()
+
+    async def test_nonzero_exit_cannot_confirm_completion(self):
+        proc = FakeProcess([])
+        proc.wait.return_value = 7
+        repo = Path("/example/repo")
+        with mock.patch("acp_client.asyncio.create_subprocess_exec", return_value=proc):
+            with self.assertRaisesRegex(ACPError, "shut down cleanly"):
+                async with open_devin("devin", repo, {}, Path("/example/config.json")):
+                    pass
 
     async def test_failed_request_kills_launched_process_group(self):
         proc = FakeProcess([])

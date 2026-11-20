@@ -119,7 +119,7 @@ async def open_devin(binary, workdir, env, config):
                 async with asyncio.timeout(3):
                     while await process.stdout.read(65536):
                         pass
-                    await process.wait()
+                    exit_code = await process.wait()
             except (TimeoutError, OSError):
                 pass
             else:
@@ -134,3 +134,5 @@ async def open_devin(binary, workdir, env, config):
                 while await process.stdout.read(65536):
                     pass
                 await process.wait()
+        if completed and (not reaped or exit_code != 0):
+            raise ACPError("Devin did not shut down cleanly")
