@@ -338,5 +338,46 @@ class RunDevinTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(client.posts), 2)
 
 
+class FakeOAuthClient:
+    """Stands in for AsyncWebClient: rotates app tokens, rejects bot tokens."""
+
+    calls = []
+
+    async def oauth_v2_access(self, **kwargs):
+        refresh = kwargs["refresh_token"]
+        FakeOAuthClient.calls.append(refresh)
+        if refresh.startswith("xoxe-bot-"):
+            raise RuntimeError("invalid_refresh_token")
+        return {"access_token": "xapp-new", "refresh_token": "xoxe-app-R2", "expires_in": 43200}
+
+
+class TokenManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rotated_token_is_persisted_when_a_later_refresh_fails(self):
+        state_file = Path(tempfile.mkdtemp()) / "token_state.json"
+        handler = mock.Mock()
+        client = mock.Mock()
+        FakeOAuthClient.calls = []
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "BRIDGE_APP_REFRESH_TOKEN": "xoxe-app-R1",
+                "BRIDGE_BOT_REFRESH_TOKEN": "xoxe-bot-R1",
+            },
+        ), mock.patch.object(bridge, "TOKEN_STATE_FILE", state_file), mock.patch.object(
+            bridge, "AsyncWebClient", FakeOAuthClient
+        ):
+            manager = bridge.TokenManager()
+            with self.assertRaises(RuntimeError):
+                await manager.refresh_once(client, handler)
+
+            restarted = bridge.TokenManager()
+
+        self.assertEqual(FakeOAuthClient.calls, ["xoxe-app-R1", "xoxe-bot-R1"])
+        self.assertEqual(handler.client.app_token, "xapp-new")
+        self.assertEqual(restarted.kinds["app"]["refresh"], "xoxe-app-R2")
+        self.assertEqual(restarted.kinds["bot"]["refresh"], "xoxe-bot-R1")
+
+
 if __name__ == "__main__":
     unittest.main()

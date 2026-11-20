@@ -92,7 +92,8 @@ class TokenManager:
                 app._token = new_token
             k["refresh"] = resp.get("refresh_token") or k["refresh"]
             k["expires"] = time.time() + int(resp.get("expires_in", 43200))
-        self._save()
+            # refresh tokens are single-use: persist each rotation before the next call can fail
+            self._save()
 
     async def loop(self, client: AsyncWebClient, handler) -> None:
         failures = 0
