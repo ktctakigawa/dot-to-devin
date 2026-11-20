@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from weakref import WeakValueDictionary
 
@@ -214,14 +215,21 @@ async def thread_context(
     client, channel: str, thread_ts: str, allowed_users: set[str] | None = None
 ) -> str:
     allowed = ALLOWED_USERS if allowed_users is None else allowed_users
+    messages = deque(maxlen=THREAD_CONTEXT_LIMIT)
+    cursor = None
     try:
-        resp = await client.conversations_replies(
-            channel=channel, ts=thread_ts, limit=THREAD_CONTEXT_LIMIT
-        )
+        while True:
+            resp = await client.conversations_replies(
+                channel=channel, ts=thread_ts, limit=THREAD_CONTEXT_LIMIT, cursor=cursor
+            )
+            messages.extend(resp.get("messages") or [])
+            cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
     except Exception as e:
         return f"(failed to fetch thread context: {e})"
     lines = []
-    for m in (resp.get("messages") or [])[-THREAD_CONTEXT_LIMIT:]:
+    for m in messages:
         user = m.get("user")
         if not user or user not in allowed:
             continue
