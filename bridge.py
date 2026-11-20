@@ -21,6 +21,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from weakref import WeakValueDictionary
 
 from dotenv import load_dotenv
 from slack_bolt.async_app import AsyncApp
@@ -45,6 +46,7 @@ DEVIN_BIN = os.environ.get("DEVIN_BIN", "devin")
 
 app = AsyncApp(token=BOT_TOKEN)
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+thread_locks: WeakValueDictionary[tuple[str, str], asyncio.Lock] = WeakValueDictionary()
 
 REFRESH_MARGIN = 7200
 TOKEN_STATE_FILE = Path(__file__).with_name("token_state.json")
@@ -143,6 +145,15 @@ class SessionMap:
 thread_sessions = SessionMap()
 
 
+def get_thread_lock(channel: str, key: str) -> asyncio.Lock:
+    identity = (channel, key)
+    lock = thread_locks.get(identity)
+    if lock is None:
+        lock = asyncio.Lock()
+        thread_locks[identity] = lock
+    return lock
+
+
 async def devin_session_ids(workdir: Path) -> dict[str, float]:
     """Return {session_id: last_activity_at} for sessions rooted at workdir."""
     try:
@@ -227,6 +238,35 @@ async def thread_context(
 
 
 async def run_devin(
+    client,
+    channel: str,
+    key: str,
+    thread_ts: str,
+    user: str,
+    task: str,
+    workdir: Path,
+    session_id: str | None = None,
+    lock: asyncio.Lock | None = None,
+    bot_user_id: str | None = None,
+) -> None:
+    if lock is None:
+        lock = get_thread_lock(channel, key)
+    async with lock:
+        mapped = thread_sessions.get(channel, key)
+        if mapped:
+            mapped_workdir = Path(mapped["workdir"])
+            mapped_session_id = mapped["session_id"]
+            if (mapped_workdir, mapped_session_id) != (workdir, session_id):
+                ids = await devin_session_ids(mapped_workdir)
+                if mapped_session_id in ids:
+                    workdir = mapped_workdir
+                    session_id = mapped_session_id
+        await _run_devin(
+            client, channel, key, thread_ts, user, task, workdir, session_id, bot_user_id
+        )
+
+
+async def _run_devin(
     client,
     channel: str,
     key: str,
@@ -362,6 +402,7 @@ async def on_mention(event, client, context=None):
         )
         return
 
+    lock = get_thread_lock(channel, key)
     try:
         await client.reactions_add(channel=channel, name="eyes", timestamp=ts)
     except Exception:
@@ -376,6 +417,7 @@ async def on_mention(event, client, context=None):
             task,
             workdir,
             session_id,
+            lock,
             bot_user_id,
         )
     )
