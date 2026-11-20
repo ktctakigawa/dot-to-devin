@@ -4,3 +4,4 @@ __pycache__/
 *.log
 token_state.json
 thread_sessions.json
+thread_sessions.sqlite3*

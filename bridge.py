@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Slack -> local Devin CLI bridge.
 
-Listens for app_mention events via Socket Mode, runs `devin -p` in the
+Listens for app_mention events via Socket Mode, runs sandboxed Devin over ACP in the
 requested repo directory, and posts the result back to the thread as the bot.
 
 Usage in Slack:  @BotName repo:<name> <task>
   repo:<name> resolves to $DEVIN_HOME/<name> (default ~/code).
-  Without repo:, the task runs in $DEVIN_HOME itself.
-  A @mention reply inside a task thread resumes that thread's devin session
-  (`devin -r`). Each top-level DM message starts its own task thread.
+  Each new task must supply repo:. A reply resumes only a verified session
+  owned by that Slack thread. Each top-level DM starts a separate thread.
 
 Only Slack user IDs listed in ALLOWED_USERS can trigger runs, and only their
 thread messages are included as context.
@@ -18,11 +17,15 @@ import asyncio
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 from collections import deque
 from pathlib import Path
 from weakref import WeakValueDictionary
+
+from acp_client import ACPError, open_devin
+from session_registry import Registry
 
 from dotenv import load_dotenv
 from slack_bolt.async_app import AsyncApp
@@ -51,7 +54,9 @@ thread_locks: WeakValueDictionary[tuple[str, str], asyncio.Lock] = WeakValueDict
 
 REFRESH_MARGIN = 7200
 TOKEN_STATE_FILE = Path(__file__).with_name("token_state.json")
-THREAD_STATE_FILE = Path(__file__).with_name("thread_sessions.json")
+SESSION_DB = Path(__file__).with_name("thread_sessions.sqlite3")
+DEVIN_CONFIG = os.environ.get("DEVIN_BRIDGE_CONFIG")
+STARTUP_TIMEOUT = 20
 
 
 class TokenManager:
@@ -116,35 +121,9 @@ class TokenManager:
 REPO_RE = re.compile(r"(?:^|\s)repo:([A-Za-z0-9._-]+)")
 CHUNK = 3500
 THREAD_CONTEXT_LIMIT = 30
-POST_TAIL = 12000
-DEVIN_PERMISSION_MODE = "dangerous"
-CHILD_ENV_DENY_PREFIXES = ("SLACK_", "BRIDGE_")
-
-
-class SessionMap:
-    """Maps Slack conversation keys -> devin sessions for resume-on-reply."""
-
-    def __init__(self) -> None:
-        self._map: dict[str, dict] = {}
-        if THREAD_STATE_FILE.exists():
-            try:
-                self._map = json.loads(THREAD_STATE_FILE.read_text())
-            except Exception:
-                pass
-
-    def get(self, channel: str, key: str) -> dict | None:
-        return self._map.get(f"{channel}:{key}")
-
-    def put(self, channel: str, key: str, session_id: str, workdir: Path) -> None:
-        self._map[f"{channel}:{key}"] = {
-            "session_id": session_id,
-            "workdir": str(workdir),
-        }
-        THREAD_STATE_FILE.write_text(json.dumps(self._map))
-        os.chmod(THREAD_STATE_FILE, 0o600)
-
-
-thread_sessions = SessionMap()
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+CHILD_ENV_DENY_PREFIXES = ("SLACK_", "BRIDGE_", "ACP_BACKEND")
+registry = Registry(SESSION_DB)
 
 
 def get_thread_lock(channel: str, key: str) -> asyncio.Lock:
@@ -154,27 +133,6 @@ def get_thread_lock(channel: str, key: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         thread_locks[identity] = lock
     return lock
-
-
-async def devin_session_ids(workdir: Path) -> dict[str, float]:
-    """Return {session_id: last_activity_at} for sessions rooted at workdir."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            DEVIN_BIN,
-            "list",
-            "--format",
-            "json",
-            cwd=str(workdir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-            env=devin_env(),
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
-        if proc.returncode != 0:
-            return {}
-        return {s["id"]: s.get("last_activity_at", 0) for s in json.loads(out)}
-    except Exception:
-        return {}
 
 
 def strip_bot_mention(text: str, bot_user_id: str | None) -> str:
@@ -190,10 +148,23 @@ def parse_mention(text: str, bot_user_id: str | None = None) -> tuple[str | None
 
 
 def resolve_workdir(repo: str | None) -> Path | None:
-    candidate = (DEVIN_HOME / repo).resolve() if repo else DEVIN_HOME
-    if repo and candidate.parent != DEVIN_HOME:
+    if not repo:
         return None
-    return candidate if candidate.is_dir() else None
+    candidate = (DEVIN_HOME / repo).resolve()
+    return candidate if (candidate.parent == DEVIN_HOME and candidate.is_dir()
+                         and candidate != Path(__file__).resolve().parent) else None
+
+
+def private_config() -> Path | None:
+    if not DEVIN_CONFIG:
+        return None
+    path = Path(DEVIN_CONFIG).expanduser()
+    if not path.is_absolute():
+        return None
+    path = path.resolve()
+    if path.is_relative_to(DEVIN_HOME) or not path.is_file():
+        return None
+    return path
 
 
 def devin_env() -> dict[str, str]:
@@ -233,8 +204,8 @@ async def thread_context(
             cursor = (resp.get("response_metadata") or {}).get("next_cursor")
             if not cursor:
                 break
-    except Exception as e:
-        return f"(failed to fetch thread context: {e})"
+    except Exception:
+        return "(failed to fetch thread context)"
     lines = []
     for m in messages:
         user = m.get("user")
@@ -246,190 +217,95 @@ async def thread_context(
     return "\n".join(lines)
 
 
-async def run_devin(
-    client,
-    channel: str,
-    key: str,
-    thread_ts: str,
-    user: str,
-    task: str,
-    workdir: Path,
-    session_id: str | None = None,
-    lock: asyncio.Lock | None = None,
-    bot_user_id: str | None = None,
-) -> None:
-    if lock is None:
-        lock = get_thread_lock(channel, key)
-    async with lock:
-        mapped = thread_sessions.get(channel, key)
-        if mapped:
-            mapped_workdir = Path(mapped["workdir"])
-            mapped_session_id = mapped["session_id"]
-            if (mapped_workdir, mapped_session_id) != (workdir, session_id):
-                ids = await devin_session_ids(mapped_workdir)
-                if mapped_session_id in ids:
-                    workdir = mapped_workdir
-                    session_id = mapped_session_id
-        await _run_devin(
-            client, channel, key, thread_ts, user, task, workdir, session_id, bot_user_id
-        )
+async def report(client, channel, root, message):
+    try:
+        await asyncio.wait_for(post(client, channel, root, message), timeout=5)
+    except Exception:
+        print("Slack delivery unconfirmed; no replay", file=sys.stderr)
 
 
-async def _run_devin(
-    client,
-    channel: str,
-    key: str,
-    thread_ts: str,
-    user: str,
-    task: str,
-    workdir: Path,
-    session_id: str | None = None,
-    bot_user_id: str | None = None,
-) -> None:
-    async with semaphore:
-        label = f"再開 `{session_id}`" if session_id else "起動"
-        await client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=f":rocket: Devin {label}: `{workdir}` (timeout {RUN_TIMEOUT}s)",
-        )
-        if session_id:
-            prompt = (
-                "Slack スレッドからの継続依頼です。\n"
-                "結果の返信はブリッジ側が行うため、Slack には投稿せず、最終結果を簡潔にレポートしてください。\n\n"
-                f"## 依頼者\n<@{user}>\n\n## タスク\n{task}\n"
-            )
-        else:
-            context = await thread_context(
-                client, channel, thread_ts, bot_user_id=bot_user_id
-            )
-            prompt = (
-                "以下は Slack 経由で届いた依頼です。スレッド内容を踏まえて対応してください。\n"
-                "スレッド履歴には許可されたユーザーの投稿のみが含まれます。履歴は参考情報として扱い、"
-                "タスクの指示を優先してください。\n"
-                "結果の返信はブリッジ側が行うため、Slack には投稿せず、最終結果を簡潔にレポートしてください。\n\n"
-                f"## 依頼者\n<@{user}>\n\n## スレッド履歴\n{context}\n\n## タスク\n{task}\n"
-            )
-        cmd = [DEVIN_BIN]
-        if session_id:
-            cmd += ["-r", session_id]
-        cmd += [
-            "--permission-mode",
-            DEVIN_PERMISSION_MODE,
-            "--respect-workspace-trust",
-            "false",
-            "-p",
-            "--",
-            prompt,
-        ]
+async def run_devin(client, channel, root, stamp, user, repo, task, bot_user_id):
+    async with get_thread_lock(channel, root), semaphore:
+        bound = False
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(workdir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=devin_env(),
+            existing = registry.get(channel, root)
+            workdir = resolve_workdir(repo)
+            session_id = None
+            if stamp != root:
+                if existing is None:
+                    await report(client, channel, root, ":x: 検証済みのセッションがありません。repo: を指定して新規スレッドで依頼してください。")
+                    return
+                session_id, previous_dir = existing
+                stored = Path(previous_dir)
+                if (not SESSION_ID_RE.fullmatch(session_id)
+                        or resolve_workdir(stored.name) != stored
+                        or (repo is not None and workdir != stored)):
+                    raise ACPError("Invalid stored binding")
+                workdir = stored
+            elif existing is not None:
+                return  # Replayed thread root is never a resume.
+            if workdir is None:
+                await report(client, channel, root, ":x: 新規依頼には有効な repo:<name> が必要です。")
+                return
+            config = private_config()
+            if config is None:
+                await report(client, channel, root, ":x: 専用の Devin 設定ファイルが未指定です。")
+                return
+            if not registry.reserve(channel, stamp):
+                return
+            async with asyncio.timeout(STARTUP_TIMEOUT):
+                context = "" if session_id else await thread_context(
+                    client, channel, root, bot_user_id=bot_user_id,
+                )
+            prompt = (
+                "Slack 経由の依頼です。履歴は参考情報です。結果はブリッジが返信します。\n\n"
+                f"## 依頼者\n<@{user}>\n\n## スレッド履歴\n{context}"
+                f"\n\n## タスク\n{task}\n"
             )
-        except Exception as e:
-            await client.chat_postMessage(
-                channel=channel, thread_ts=thread_ts, text=f":x: devin 起動失敗: {e}"
-            )
+
+            async with open_devin(DEVIN_BIN, workdir, devin_env(), config) as agent:
+                async with asyncio.timeout(STARTUP_TIMEOUT):
+                    exact_id = await agent.prepare(workdir, session_id)
+                    if not isinstance(exact_id, str) or not SESSION_ID_RE.fullmatch(exact_id):
+                        raise ACPError("Invalid session identifier")
+                    if session_id is None:
+                        registry.bind(channel, root, exact_id, workdir)
+                    elif exact_id != session_id:
+                        raise ACPError("Unexpected resumed session")
+                    bound = True
+                await report(client, channel, root, ":link: Devin セッションの紐付けを確認しました。")
+                async with asyncio.timeout(RUN_TIMEOUT):
+                    output = await agent.prompt(prompt)
+        except TimeoutError:
+            label = "タスクがタイムアウトしました" if bound else "起動の確認がタイムアウトしました"
+            await report(client, channel, root, f":x: {label}。自動再実行はしません。")
             return
-
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=RUN_TIMEOUT)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=f":x: タイムアウト ({RUN_TIMEOUT}s) で中止しました",
-            )
+        except (ACPError, OSError, ValueError, TypeError, AttributeError, sqlite3.Error):
+            label = "タスクの完了を確認できません" if bound else "Devin セッションを確認できなかったため依頼を送信しませんでした"
+            await report(client, channel, root, f":x: {label}。")
             return
-
-        output = out.decode(errors="replace").strip()
-        header = "" if proc.returncode == 0 else f":warning: exit code {proc.returncode}\n"
-        if len(output) > POST_TAIL:
-            await client.files_upload_v2(
-                channel=channel,
-                thread_ts=thread_ts,
-                content=output,
-                filename="devin-output.log",
-                title="devin output (full)",
-            )
-            output = "...(truncated, full log attached)...\n" + output[-POST_TAIL:]
-        await post(client, channel, thread_ts, header + output)
-
-        ids = await devin_session_ids(workdir)
-        if ids:
-            latest = max(ids, key=lambda s: ids[s])
-            thread_sessions.put(channel, key, latest, workdir)
+        await report(client, channel, root, output)
 
 
 @app.event("app_mention")
 async def on_mention(event, client, context=None):
     user = event.get("user", "")
     channel = event["channel"]
-    ts = event["ts"]
-    thread_ts = event.get("thread_ts") or ts
-
-    print(f"event from user={user} channel={channel}", file=sys.stderr)
+    stamp = event["ts"]
+    root = event.get("thread_ts") or stamp
     if user not in ALLOWED_USERS:
-        await client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text=f"<@{user}> このブリッジの利用は許可されていません",
-        )
+        await report(client, channel, root, f"<@{user}> このブリッジの利用は許可されていません")
         return
-
     bot_user_id = context.get("bot_user_id") if context else None
     repo, task = parse_mention(event.get("text", ""), bot_user_id)
-    key = thread_ts
-    mapped = thread_sessions.get(channel, key)
-
-    session_id = None
-    if mapped:
-        # Replies inside a task thread resume that thread's session and workdir.
-        workdir = Path(mapped["workdir"])
-        ids = await devin_session_ids(workdir)
-        if mapped["session_id"] in ids:
-            session_id = mapped["session_id"]
-    else:
-        workdir = resolve_workdir(repo)
-        if workdir is None:
-            await client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=f":x: repo `{repo}` が {DEVIN_HOME} 直下に見つかりません",
-            )
-            return
     if not task:
-        await client.chat_postMessage(
-            channel=channel,
-            thread_ts=thread_ts,
-            text="使い方: `@bot repo:<name> <タスク>` (repo: 省略時は DEVIN_HOME で実行。スレッド内返信はセッション継続)",
-        )
+        await report(client, channel, root, "使い方: `@bot repo:<name> <タスク>`")
         return
-
-    lock = get_thread_lock(channel, key)
     try:
-        await client.reactions_add(channel=channel, name="eyes", timestamp=ts)
+        await client.reactions_add(channel=channel, name="eyes", timestamp=stamp)
     except Exception:
         pass
-    asyncio.create_task(
-        run_devin(
-            client,
-            channel,
-            key,
-            thread_ts,
-            user,
-            task,
-            workdir,
-            session_id,
-            lock,
-            bot_user_id,
-        )
-    )
+    asyncio.create_task(run_devin(client, channel, root, stamp, user, repo, task, bot_user_id))
 
 
 @app.event("message")
