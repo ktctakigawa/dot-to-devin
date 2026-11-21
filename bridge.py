@@ -117,7 +117,7 @@ REPO_RE = re.compile(r"(?:^|\s)repo:([A-Za-z0-9._-]+)")
 CHUNK = 3500
 THREAD_CONTEXT_LIMIT = 30
 POST_TAIL = 12000
-DEVIN_PERMISSION_MODE = "dangerous"
+DEVIN_MODEL = "swe-2-max"
 CHILD_ENV_DENY_PREFIXES = ("SLACK_", "BRIDGE_")
 
 
@@ -314,10 +314,11 @@ async def _run_devin(
         if session_id:
             cmd += ["-r", session_id]
         cmd += [
-            "--permission-mode",
-            DEVIN_PERMISSION_MODE,
             "--respect-workspace-trust",
             "false",
+            "--model",
+            DEVIN_MODEL,
+            "--sandbox",
             "-p",
             "--",
             prompt,
