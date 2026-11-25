@@ -117,7 +117,7 @@ REPO_RE = re.compile(r"(?:^|\s)repo:([A-Za-z0-9._-]+)")
 CHUNK = 3500
 THREAD_CONTEXT_LIMIT = 30
 POST_TAIL = 12000
-DEVIN_MODEL = "swe-2-max"
+DEVIN_MODEL = "swe-2-1-max"
 CHILD_ENV_DENY_PREFIXES = ("SLACK_", "BRIDGE_")
 
 
